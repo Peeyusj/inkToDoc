@@ -12,7 +12,9 @@ import {
   Shield,
   PenTool,
   FileCheck,
-  ArrowDown
+  ArrowDown,
+  RotateCcw,
+  Info
 } from 'lucide-react';
 
 type FileStatus = 'pending' | 'processing' | 'completed' | 'error';
@@ -31,6 +33,7 @@ interface ProcessedResult {
 }
 
 const MAX_FILES = 3;
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 
 // Loading spinner
 const Spinner = () => (
@@ -62,29 +65,66 @@ export default function OCRApp() {
   const [progress, setProgress] = useState('');
   const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
+  const [notification, setNotification] = useState<string>('');
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
 
-  const API_URL = import.meta.env.VITE_API_URL;
+  const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+
+  const showNotification = (message: string) => {
+    setNotification(message);
+    setTimeout(() => setNotification(''), 4000);
+  };
 
   const handleFileSelect = useCallback((files: FileList | null) => {
     if (!files) return;
     
     const imageFiles = Array.from(files).filter(file => file.type.startsWith('image/'));
-    const totalFiles = selectedFiles.length + imageFiles.length;
     
-    if (totalFiles > MAX_FILES) {
-      alert(`Maximum ${MAX_FILES} files allowed.`);
+    if (imageFiles.length === 0) {
+      showNotification('⚠️ Please upload image files only (PNG, JPG, etc.)');
       return;
     }
+
+    const validFiles: FileData[] = [];
+    let tooLarge = 0;
+
+    imageFiles.forEach(file => {
+      if (file.size > MAX_FILE_SIZE) {
+        tooLarge++;
+      } else {
+        validFiles.push({
+          file,
+          preview: URL.createObjectURL(file),
+          id: Math.random().toString(36).substr(2, 9),
+          status: 'pending',
+          error: null
+        });
+      }
+    });
+
+    if (tooLarge > 0) {
+      showNotification(`⚠️ ${tooLarge} file(s) exceed 10MB limit and were skipped`);
+    }
+
+    const totalFiles = selectedFiles.length + validFiles.length;
     
-    const filesWithPreview: FileData[] = imageFiles.map(file => ({
-      file,
-      preview: URL.createObjectURL(file),
-      id: Math.random().toString(36).substr(2, 9),
-      status: 'pending',
-      error: null
-    }));
-    
-    setSelectedFiles(prev => [...prev, ...filesWithPreview]);
+    if (totalFiles > MAX_FILES) {
+      showNotification(`⚠️ Maximum ${MAX_FILES} files allowed. ${totalFiles - MAX_FILES} file(s) not added.`);
+      const remainingSlots = MAX_FILES - selectedFiles.length;
+      const filesToAdd = validFiles.slice(0, Math.max(0, remainingSlots));
+      setSelectedFiles(prev => [...prev, ...filesToAdd]);
+      filesToAdd.forEach((f, i) => {
+        if (i >= remainingSlots) {
+          URL.revokeObjectURL(f.preview);
+        }
+      });
+    } else {
+      setSelectedFiles(prev => [...prev, ...validFiles]);
+      if (validFiles.length > 0) {
+        showNotification(`✅ Added ${validFiles.length} file(s)`);
+      }
+    }
+
     if (processedResult) {
       URL.revokeObjectURL(processedResult.downloadUrl);
       setProcessedResult(null);
@@ -160,43 +200,55 @@ export default function OCRApp() {
     if (selectedFiles.length === 0) return;
 
     setProcessing(true);
-    setProgress('Uploading...');
+    setProgress('Uploading images...');
     setSelectedFiles(prev => prev.map(f => ({ ...f, status: 'processing' })));
 
     try {
       const formData = new FormData();
       selectedFiles.forEach(fileData => formData.append('files', fileData.file));
 
-      setProgress('Starting conversion...');
+      setProgress('Processing with AI...');
       const startResponse = await fetch(`${API_URL}/start-batch-conversion`, {
         method: 'POST',
         body: formData,
       });
 
-      if (!startResponse.ok) throw new Error(`Failed to start: ${startResponse.status}`);
+      if (!startResponse.ok) {
+        throw new Error(`Server error: ${startResponse.status}. Please check if the API is running.`);
+      }
 
       const { call_id } = await startResponse.json();
 
       let isReady = false;
       let attempts = 0;
+      const maxAttempts = 300; // 5 minutes
 
-      while (!isReady && attempts < 180) {
+      while (!isReady && attempts < maxAttempts) {
         await new Promise(resolve => setTimeout(resolve, 1000));
         const statusResponse = await fetch(`${API_URL}/check-status/${call_id}`);
+        
+        if (!statusResponse.ok) {
+          throw new Error('Failed to check processing status');
+        }
+
         const statusData = await statusResponse.json();
         
-        if (statusData.status === 'completed') isReady = true;
-        else if (statusData.status === 'error') throw new Error(statusData.error || 'Processing failed');
+        if (statusData.status === 'completed') {
+          isReady = true;
+        } else if (statusData.status === 'error') {
+          throw new Error(statusData.error || 'Processing failed. Please try again.');
+        }
         
         attempts++;
-        setProgress(`Processing... ${attempts}s`);
+        const timeLeft = Math.ceil((maxAttempts - attempts) / 60);
+        setProgress(`Processing... ${attempts}s (${timeLeft}m remaining)`);
       }
 
-      if (!isReady) throw new Error('Timeout');
+      if (!isReady) throw new Error('Processing timeout. Please try again with fewer files.');
 
       setProgress('Preparing download...');
       const downloadResponse = await fetch(`${API_URL}/download-combined/${call_id}`);
-      if (!downloadResponse.ok) throw new Error('Download failed');
+      if (!downloadResponse.ok) throw new Error('Failed to download result. Please try again.');
 
       const blob = await downloadResponse.blob();
       const downloadUrl = window.URL.createObjectURL(blob);
@@ -204,11 +256,13 @@ export default function OCRApp() {
       setProcessedResult({ downloadUrl, filename: 'converted_document.docx' });
       setSelectedFiles(prev => prev.map(f => ({ ...f, status: 'completed' })));
       setProgress('');
+      showNotification('✅ Conversion complete! Ready to download.');
 
     } catch (error) {
-      const msg = error instanceof Error ? error.message : 'Unknown error';
+      const msg = error instanceof Error ? error.message : 'An unknown error occurred';
       setSelectedFiles(prev => prev.map(f => ({ ...f, status: 'error', error: msg })));
       setProgress('');
+      showNotification(`❌ ${msg}`);
     } finally {
       setProcessing(false);
     }
@@ -229,6 +283,14 @@ export default function OCRApp() {
     setSelectedFiles([]);
     setProcessedResult(null);
     setProgress('');
+    setShowClearConfirm(false);
+    showNotification('🗑️ All files cleared');
+  };
+
+  const retryFailedFiles = () => {
+    setSelectedFiles(prev => prev.map(f => 
+      f.status === 'error' ? { ...f, status: 'pending', error: null } : f
+    ));
   };
 
   const scrollToUpload = () => {
@@ -237,6 +299,41 @@ export default function OCRApp() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-white">
+
+      {/* Notification Toast */}
+      {notification && (
+        <div className="fixed top-4 right-4 z-50">
+          <div className="bg-slate-800 border border-slate-700 rounded-lg px-4 py-3 shadow-lg max-w-sm animate-in fade-in slide-in-from-top-2 duration-300">
+            <p className="text-sm text-slate-200">{notification}</p>
+          </div>
+        </div>
+      )}
+
+      {/* Clear Confirmation Dialog */}
+      {showClearConfirm && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/50 backdrop-blur-sm px-4">
+          <div className="bg-slate-900 rounded-2xl border border-slate-700 p-6 max-w-sm w-full">
+            <h3 className="text-lg font-semibold text-white mb-2">Clear all files?</h3>
+            <p className="text-sm text-slate-400 mb-6">
+              This will remove all {selectedFiles.length} file(s). This cannot be undone.
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setShowClearConfirm(false)}
+                className="flex-1 px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-white transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={clearAll}
+                className="flex-1 px-4 py-2 rounded-lg bg-red-600 hover:bg-red-500 text-white transition-colors"
+              >
+                Clear All
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="fixed inset-0 pointer-events-none">
   {/* Fine Grid */}
@@ -333,8 +430,9 @@ export default function OCRApp() {
               </div>
               {selectedFiles.length > 0 && !processing && (
                 <button
-                  onClick={clearAll}
+                  onClick={() => setShowClearConfirm(true)}
                   className="px-3 py-1.5 rounded-lg text-sm text-slate-400 hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                  title="Remove all files"
                 >
                   Clear all
                 </button>
@@ -366,11 +464,11 @@ export default function OCRApp() {
                   <p className="text-slate-300 font-medium mb-1">
                     {selectedFiles.length >= MAX_FILES 
                       ? 'Maximum files reached' 
-                      : 'Drop images here or click to upload'
+                      : 'Drag images here or click to upload'
                     }
                   </p>
                   <p className="text-sm text-slate-500">
-                    {selectedFiles.length}/{MAX_FILES} files
+                    {selectedFiles.length}/{MAX_FILES} files selected
                   </p>
                   
                   <input
@@ -380,6 +478,7 @@ export default function OCRApp() {
                     onChange={handleInputChange}
                     className="hidden"
                     disabled={processing || selectedFiles.length >= MAX_FILES}
+                    aria-label="Upload image files"
                   />
                 </div>
               </label>
@@ -435,17 +534,32 @@ export default function OCRApp() {
                           </p>
                         </div>
 
-                        {/* Status */}
-                        {fileData.status === 'processing' && (
-                          <div className="flex items-center gap-2 text-violet-400 text-sm">
-                            <Spinner />
+                        <div className="flex items-center gap-2">
+                          {fileData.status === 'processing' && (
+                            <div className="flex items-center gap-2 text-violet-400 text-sm">
+                              <Spinner />
+                            </div>
+                          )}
+                          {fileData.status === 'completed' && (
+                            <span title="Converted successfully">
+                              <CheckCircle2 className="w-5 h-5 text-emerald-400" />
+                            </span>
+                          )}
+                          {fileData.status === 'error' && (
+                            <span title="Conversion failed">
+                              <AlertCircle className="w-5 h-5 text-red-400" />
+                            </span>
+                          )}
+                          {fileData.status === 'pending' && (
+                            <div className="w-5 h-5 rounded-full border-2 border-slate-600 border-t-violet-400" title="Pending" />
+                          )}
+                        </div>
+                        
+                        {/* Error Message */}
+                        {fileData.status === 'error' && fileData.error && (
+                          <div className="text-xs text-red-400 flex-1 px-2">
+                            {fileData.error}
                           </div>
-                        )}
-                        {fileData.status === 'completed' && (
-                          <CheckCircle2 className="w-5 h-5 text-emerald-400" />
-                        )}
-                        {fileData.status === 'error' && (
-                          <AlertCircle className="w-5 h-5 text-red-400" />
                         )}
 
                         {/* Move Buttons */}
@@ -485,32 +599,49 @@ export default function OCRApp() {
 
               {/* Action Buttons */}
               {selectedFiles.length > 0 && (
-                <div className="mt-6 flex gap-3">
-                  <button
-                    onClick={processAllFiles}
-                    disabled={processing}
-                    className="flex-1 flex items-center justify-center gap-2 px-5 py-3 rounded-xl font-medium transition-all disabled:opacity-50 disabled:cursor-not-allowed bg-gradient-to-r from-violet-600 to-purple-600 hover:from-violet-500 hover:to-purple-500 text-white"
-                  >
-                    {processing ? (
-                      <>
-                        <Spinner />
-                        <span>{progress}</span>
-                      </>
-                    ) : (
-                      <>
-                        <Zap className="w-5 h-5" />
-                        <span>Convert to Document</span>
-                      </>
-                    )}
-                  </button>
-
-                  {processedResult && !processing && (
+                <div className="mt-6 space-y-3">
+                  {/* Main Action */}
+                  <div className="flex gap-3">
                     <button
-                      onClick={downloadResult}
-                      className="flex items-center gap-2 px-5 py-3 rounded-xl font-medium bg-emerald-600 hover:bg-emerald-500 text-white transition-colors"
+                      onClick={processAllFiles}
+                      disabled={processing}
+                      className="flex-1 flex items-center justify-center gap-2 px-5 py-3 rounded-xl font-medium transition-all disabled:opacity-50 disabled:cursor-not-allowed bg-gradient-to-r from-violet-600 to-purple-600 hover:from-violet-500 hover:to-purple-500 text-white"
+                      title={processing ? 'Processing...' : 'Convert selected files to document'}
                     >
-                      <Download className="w-5 h-5" />
-                      <span>Download</span>
+                      {processing ? (
+                        <>
+                          <Spinner />
+                          <span className="text-sm">{progress}</span>
+                        </>
+                      ) : (
+                        <>
+                          <Zap className="w-5 h-5" />
+                          <span>Convert to Document</span>
+                        </>
+                      )}
+                    </button>
+
+                    {processedResult && !processing && (
+                      <button
+                        onClick={downloadResult}
+                        className="flex items-center gap-2 px-5 py-3 rounded-xl font-medium bg-emerald-600 hover:bg-emerald-500 text-white transition-colors"
+                        title="Download converted document"
+                      >
+                        <Download className="w-5 h-5" />
+                        <span>Download</span>
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Retry Button for Failed Files */}
+                  {selectedFiles.some(f => f.status === 'error') && !processing && (
+                    <button
+                      onClick={retryFailedFiles}
+                      className="w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-sm bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition-colors border border-slate-700"
+                      title="Retry conversion for failed files"
+                    >
+                      <RotateCcw className="w-4 h-4" />
+                      Retry Failed Files
                     </button>
                   )}
                 </div>
@@ -518,10 +649,18 @@ export default function OCRApp() {
 
               {/* Empty State */}
               {selectedFiles.length === 0 && (
-                <div className="mt-4 text-center">
-                  <p className="text-sm text-slate-500">
-                    Supported: Handwritten notes, printed documents, receipts, forms
-                  </p>
+                <div className="mt-6 p-4 rounded-lg bg-slate-800/50 border border-slate-700/50">
+                  <div className="flex gap-3 items-start">
+                    <Info className="w-5 h-5 text-blue-400 flex-shrink-0 mt-0.5" />
+                    <div>
+                      <p className="text-sm font-medium text-slate-300 mb-2">Supported formats:</p>
+                      <ul className="text-xs text-slate-400 space-y-1">
+                        <li>• Image formats: PNG, JPG, JPEG, GIF, WebP</li>
+                        <li>• File size: Max 10 MB per image</li>
+                        <li>• Content: Handwritten notes, printed documents, receipts, forms</li>
+                      </ul>
+                    </div>
+                  </div>
                 </div>
               )}
             </div>
